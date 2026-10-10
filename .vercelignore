@@ -1,0 +1,4 @@
+# Ficheros que no se suben a Vercel. Solo hace falta desplegar api/: backend/
+# contiene la ingesta local y los .md del perfil, que no deben servirse como
+# ficheros estáticos (vercel.json usa la raíz como outputDirectory).
+backend/

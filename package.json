@@ -1,0 +1,8 @@
+{
+  "name": "portfolio-backend",
+  "dependencies": {
+    "@upstash/ratelimit": "^2.0.0",
+    "@upstash/redis": "^1.34.0",
+    "resend": "^3.0.0"
+  }
+}

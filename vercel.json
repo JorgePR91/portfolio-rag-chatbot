@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "framework": null,
+  "buildCommand": "",
+  "outputDirectory": ".",
+  "crons": [
+    { "path": "/api/health", "schedule": "0 8 * * *" }
+  ]
+}

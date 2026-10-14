@@ -1,0 +1,5 @@
+# Dependencias para trabajar en local: incluye las de producción
+# y además lo que usa backend/ingest.py.
+-r requirements.txt
+langchain-core==1.4.8
+langchain-text-splitters==1.1.2

@@ -1,9 +1,11 @@
-fastapi
-uvicorn
-openai
-upstash-vector
-langchain-text-splitters
-python-dotenv
-requests
-upstash-ratelimit 
-upstash-redis
+# Dependencias de las funciones de Vercel (api/).
+# Versiones fijadas: Vercel reinstala en cada despliegue.
+fastapi==0.138.0
+pydantic==2.13.4
+openai==2.43.0
+upstash-vector==0.8.0
+upstash-redis==1.7.0
+upstash-ratelimit==1.1.0
+requests==2.34.2
+python-dotenv==1.2.2
+uvicorn==0.49.0

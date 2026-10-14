@@ -2,17 +2,20 @@
 
 Flujo de cada mensaje:
 
-    rate limit → guardrail → router → RAG → generación con herramientas → evaluador
+    rate limit → guardrail ∥ router → RAG → generación con herramientas
 
-El modelo solo puede responder con lo que recupera el RAG de los .md de
-backend/me/. Lo que no sabe lo registra con una herramienta que avisa por
-Telegram (ver tools.py), en lugar de inventarlo.
+El guardrail y el router se ejecutan en paralelo. El modelo solo puede
+responder con lo que recupera el RAG de los .md de backend/me/. Lo que no sabe
+lo registra con una herramienta que avisa por Telegram (ver tools.py), en lugar
+de inventarlo. El evaluador-optimizador existe, pero está desactivado (ver
+USAR_EVALUADOR). Cada petición deja una línea [metricas] en el log.
 """
 import os, sys
 
 # Vercel ejecuta cada fichero de api/ por separado: se añade su carpeta a la
 # ruta para poder importar los módulos vecinos (patterns, rag, llm, tools).
 sys.path.insert(0, os.path.dirname(__file__))
+import entorno  # noqa: F401  (carga backend/.env en local)
 from patterns import NOMBRE, check_guardrail, route, route_instructions, evaluate
 import traceback
 from fastapi import FastAPI
@@ -20,16 +23,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Literal
 import json
-from dotenv import load_dotenv
 from rag import recuperar
-from llm import responder
+from llm import responder, uso, PRECIO_ENTRADA, PRECIO_SALIDA
 import tools
 
 from fastapi import Request, HTTPException
 from upstash_ratelimit import Ratelimit, FixedWindow
 from upstash_redis import Redis
 
-load_dotenv()
+import time
+from contextlib import contextmanager
+
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
@@ -60,11 +66,13 @@ class Mensaje(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
     history: list[Mensaje] = []
-    lang: str = "es"
+    # Un idioma desconocido da error 422 en lugar de responder en castellano
+    # sin avisar.
+    lang: Literal["es", "en", "ca", "va"] = "es"
 
 
 # 10 mensajes por minuto e IP: cada mensaje cuesta varias llamadas al LLM
-# (guardrail, router, generación y evaluador), así que se limita el gasto.
+# (guardrail, router y generación), así que se limita el gasto.
 redis = Redis.from_env()
 limitador = Ratelimit(
     redis=redis,
@@ -79,6 +87,11 @@ HERRAMIENTAS = {
 }
 MAX_VUELTAS = 3  # tope de rondas de herramientas, para no colgarse
 
+# Evaluador-optimizador: desactivado por defecto. Medido con evals/chatbot.py,
+# no detectó ningún error real y empeoró respuestas correctas, a cambio de
+# ~1 s y al menos una llamada más por mensaje. Se reactiva con USAR_EVALUADOR=1.
+USAR_EVALUADOR = os.getenv("USAR_EVALUADOR", "0") == "1"
+
 # Idioma de la web (lo envía el frontend) → idioma en que debe responder el modelo.
 IDIOMAS = {
     "es": "español",
@@ -87,7 +100,7 @@ IDIOMAS = {
     "va": "valenciano/català",
 }
 
-# Mensaje de rechazo del guardrail, por idioma (fallback a español).
+# Mensaje de rechazo del guardrail, por idioma.
 RECHAZO_GUARDRAIL = {
     "es": f"Lo siento, solo puedo hablar del perfil de {NOMBRE}.",
     "en": f"Sorry, I can only talk about {NOMBRE}'s profile.",
@@ -97,7 +110,7 @@ RECHAZO_GUARDRAIL = {
 
 
 def construir_system_prompt(fragmentos, lang="es"):
-    idioma = IDIOMAS.get(lang, "español")
+    idioma = IDIOMAS[lang]
 
     # fragmentos = lista de (texto, origen, score) que devuelve recuperar()
 
@@ -112,7 +125,13 @@ def construir_system_prompt(fragmentos, lang="es"):
         - Si la respuesta NO está en el contexto, NO la inventes: usa la
           herramienta 'record_unknown_question' para registrar la pregunta.
         - Si el visitante muestra interés en contactar, pídele su email y
-          regístralo con 'record_user_details'."""
+          regístralo con 'record_user_details'.
+        - Si la pregunta da por hecho algo que el CONTEXTO contradice (un dato
+          o una cifra distintos), corrígelo con el dato correcto del CONTEXTO.
+          Eso SÍ es saber la respuesta: no la registres como desconocida.
+        - Responde a lo que se pregunta, no a todo lo que hay en el CONTEXTO.
+          Si el CONTEXTO indica cuándo es relevante una información (por
+          ejemplo, "solo son relevantes si se pregunta por..."), respétalo."""
 
     # ensamblar el contexto a partir de los fragmentos
     contexto = ""
@@ -152,7 +171,8 @@ def chat(req: ChatRequest, request: Request):
     # 2) El resto, protegido: una excepción sin capturar daría un 500 sin
     # cabeceras CORS, y el navegador solo vería "error de CORS".
     try:
-        return {"reply": procesar(req)}
+        reply, _ = procesar(req)
+        return {"reply": reply}
     except Exception:
         traceback.print_exc()  # queda en los logs de Vercel
         raise HTTPException(
@@ -160,17 +180,79 @@ def chat(req: ChatRequest, request: Request):
         )
 
 
-def procesar(req: ChatRequest) -> str:
-    """Ejecuta el flujo completo para un mensaje y devuelve la respuesta."""
+def ms_desde(inicio):
+    return round((time.perf_counter() - inicio) * 1000)
+
+
+@contextmanager
+def medir(metricas, etapa):
+    # Uso: with medir(metricas, "router"): ...  -> guarda los ms de ese bloque.
+    inicio = time.perf_counter()
+    try:
+        yield
+    finally:
+        metricas["etapas_ms"][etapa] = ms_desde(inicio)
+
+
+def medido(metricas, etapa, funcion, *args):
+    # medir() en forma de función, para poder ejecutarla en otro hilo.
+    with medir(metricas, etapa):
+        return funcion(*args)
+
+
+def procesar(req: ChatRequest) -> tuple[str, dict]:
+    """Ejecuta el flujo completo para un mensaje y devuelve (respuesta, métricas)."""
+    # Métricas de la petición: se escriben en UNA línea de log al terminar,
+    # pase lo que pase (respuesta normal, bloqueo del guardrail o excepción).
+    # Sin el texto del usuario: solo números y categorías.
+    metricas = {"lang": req.lang, "etapas_ms": {}}
+    uso.set({"llamadas": 0, "tokens_entrada": 0, "tokens_salida": 0})
+    inicio = time.perf_counter()
+    try:
+        return _procesar(req, metricas), metricas
+    finally:
+        metricas["total_ms"] = ms_desde(inicio)
+        metricas.update(uso.get())
+        metricas["coste_usd"] = round(
+            metricas["tokens_entrada"] * PRECIO_ENTRADA
+            + metricas["tokens_salida"] * PRECIO_SALIDA,
+            6,
+        )
+        visibles = {k: v for k, v in metricas.items() if not k.startswith("_")}
+        print("[metricas] " + json.dumps(visibles), flush=True)
+
+
+def _procesar(req: ChatRequest, metricas) -> str:
     history = [m.model_dump() for m in req.history[-MAX_HISTORIAL:]]
 
-    # (B) GUARDRAIL
-    guard = check_guardrail(req.message)
-    if not guard.is_safe:
-        return RECHAZO_GUARDRAIL.get(req.lang, RECHAZO_GUARDRAIL["es"])
-
-    # (C) ROUTING
-    decision = route(req.message, history)
+    # (B) GUARDRAIL y (C) ROUTING, en paralelo: ninguno necesita el resultado
+    # del otro, así que se espera al más lento en lugar de a la suma de los dos.
+    # copy_context(): los hilos nuevos no heredan las ContextVar, y sin ella las
+    # llamadas al LLM de cada hilo no sumarían en el contador 'uso'.
+    with ThreadPoolExecutor(max_workers=2) as hilos:
+        futuro_guard = hilos.submit(
+            contextvars.copy_context().run,
+            medido,
+            metricas,
+            "guardrail",
+            check_guardrail,
+            req.message,
+        )
+        futuro_ruta = hilos.submit(
+            contextvars.copy_context().run,
+            medido,
+            metricas,
+            "router",
+            route,
+            req.message,
+            history,
+        )
+        guard = futuro_guard.result()
+        if not guard.is_safe:
+            metricas["bloqueado"] = True
+            return RECHAZO_GUARDRAIL[req.lang]
+        decision = futuro_ruta.result()
+    metricas["categoria"] = decision.category
     extra = (
         "\n\n## Instrucción de enrutamiento ("
         + decision.category
@@ -179,39 +261,75 @@ def procesar(req: ChatRequest) -> str:
     )
 
     # (D) RAG + SYSTEM PROMPT
-    # Se busca con la reescritura en castellano que devuelve el router: los .md
-    # están en castellano y el modelo de embeddings rinde mal en valenciano. Esa
-    # reescritura además ya es autocontenida, así que resuelve las preguntas de
-    # seguimiento ("¿y dónde lo aprendió?") mejor que concatenar el historial.
-    fragmentos = recuperar(decision.consulta_es or req.message, k=4)
+    # Se busca con la consulta que devuelve el router: el tema de la pregunta,
+    # en castellano (como los .md; el modelo de embeddings rinde mal en
+    # valenciano), sin el nombre de la persona y autocontenida, así que también
+    # resuelve las preguntas de seguimiento ("¿y dónde lo aprendió?").
+    with medir(metricas, "rag"):
+        fragmentos = recuperar(
+            decision.consulta_es or req.message,
+            k=4,
+            incluir_secundarias=decision.pide_todo,
+        )
+
+    metricas["pide_todo"] = decision.pide_todo
+    metricas["fragmentos"] = len(fragmentos)
+    # Fichero y sección de cada fragmento ("skills.md > Idiomas"): la primera
+    # línea de cada fragmento es su ruta de títulos.
+    metricas["fuentes"] = sorted(
+        {f"{origen} > {texto.splitlines()[0]}" for texto, origen, _ in fragmentos}
+    )
     system = construir_system_prompt(fragmentos, req.lang)
 
     contexto = "".join(
         f"### {origen}\n{texto}\n\n" for (texto, origen, _) in fragmentos
     )
 
+    # Herramientas ya ejecutadas en ESTA petición. La comparten la primera
+    # generación y la regeneración, para no avisar dos veces por Telegram.
+    ejecutadas = set()
+
     # (E) GENERACIÓN con herramientas
-    reply = generar_respuesta(system, history, req.message, extra)
+    with medir(metricas, "generacion"):
+        reply = generar_respuesta(system, history, req.message, extra, ejecutadas)
 
-    # (F) EVALUADOR-OPTIMIZADOR: si la respuesta no supera la revisión, se
-    # regenera una sola vez con el motivo del rechazo (sin bucle, por coste).
-    ev = evaluate(reply, req.message, history, contexto)
-    if not ev.is_acceptable:
-        feedback = (
-            extra
-            + "\n\n## Tu respuesta fue rechazada.\nRespuesta:\n"
-            + reply
-            + "\nMotivo:\n"
-            + ev.feedback
-            + "\nCorrígela."
-        )
-        reply = generar_respuesta(system, history, req.message, feedback)
+    # (F) EVALUADOR-OPTIMIZADOR: desactivado por defecto (ver USAR_EVALUADOR).
+    # Si está activo y rechaza la respuesta, se regenera una sola vez.
+    if USAR_EVALUADOR:
+        with medir(metricas, "evaluador"):
+            ev = evaluate(reply, req.message, history, contexto, req.lang)
+        metricas["motivo"] = ev.motivo
+        if not ev.is_acceptable:
+            # Para la evaluación offline: la respuesta rechazada, el porqué y las
+            # herramientas usadas hasta ahora. Las claves que empiezan por "_" no
+            # se escriben en el log: contienen texto que puede incluir datos del visitante.
+            metricas["_revision"] = {
+                "inicial": reply,
+                "feedback": ev.feedback,
+                "herramientas_inicial": sorted(ejecutadas),
+            }
+            feedback = (
+                extra
+                + "\n\n## Tu respuesta fue rechazada.\nRespuesta:\n"
+                + reply
+                + "\nMotivo:\n"
+                + ev.feedback
+                + "\nCorrígela."
+            )
+            with medir(metricas, "regeneracion"):
+                reply = generar_respuesta(
+                    system, history, req.message, feedback, ejecutadas
+                )
 
+    metricas["herramientas"] = sorted(ejecutadas)
     return reply
 
 
-def generar_respuesta(system_base, history, message, extra_system=""):
+def generar_respuesta(system_base, history, message, extra_system="", ejecutadas=None):
     """Llama al modelo y ejecuta las herramientas que pida hasta obtener texto."""
+    if ejecutadas is None:
+        ejecutadas = set()
+
     messages = (
         [{"role": "system", "content": system_base + extra_system}]
         + history
@@ -226,12 +344,20 @@ def generar_respuesta(system_base, history, message, extra_system=""):
 
         messages.append(msg)
         for tool_call in msg.tool_calls:
-            funcion = HERRAMIENTAS.get(tool_call.function.name)
+            nombre = tool_call.function.name
+            funcion = HERRAMIENTAS.get(nombre)
             try:
                 args = json.loads(tool_call.function.arguments)
-                resultado = (
-                    funcion(**args) if funcion else {"error": "herramienta desconocida"}
-                )
+                if not funcion:
+                    resultado = {"error": "herramienta desconocida"}
+                elif nombre in ejecutadas:
+                    # Ya se ejecutó en esta petición: se le confirma al modelo
+                    # sin volver a avisar.
+                    print(f"[tools] {nombre} ya ejecutada, se omite", flush=True)
+                    resultado = {"recorded": "ok"}
+                else:
+                    resultado = funcion(**args)
+                    ejecutadas.add(nombre)
             except Exception as e:
                 resultado = {"error": type(e).__name__}
             messages.append(

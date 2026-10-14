@@ -4,12 +4,10 @@ Las dos avisan al propietario del portfolio por Telegram: cuando un visitante
 deja su email y cuando el bot no sabe responder una pregunta (señal de que
 falta información en los .md del RAG).
 """
-from dotenv import load_dotenv
 import os
 import requests
+import entorno  # noqa: F401  (carga backend/.env en local)
 
-
-load_dotenv(override=True)
 
 # --- el "avisador" ---
 # Fire-and-forget: si Telegram falla, solo se registra en los logs y el chat
@@ -41,6 +39,8 @@ def record_unknown_question(question):
     return {"recorded": "ok"}
 
 # --- los ESQUEMAS (lo que el LLM "ve" para decidir si las llama) ---
+# El modelo decide si llama a una herramienta mirando sobre todo su
+# descripción, así que las reglas de cuándo usarla van aquí.
 record_user_details_json = {
     "name": "record_user_details",
     "description": "Utiliza esta herramienta para registrar que un usuario está interesado en estar en contacto y proporcionó una dirección de correo electrónico.",
@@ -68,7 +68,7 @@ record_user_details_json = {
 
 record_unknown_question_json = {
     "name": "record_unknown_question",
-    "description": "Utiliza siempre esta herramienta para registrar cualquier pregunta que no haya podido responder porque no se sabía la respuesta.",
+    "description": "Registra una pregunta que no puedes responder porque el CONTEXTO no contiene la información que se pide. Úsala SOLO en ese caso: no la uses si la pregunta contiene un dato erróneo que puedes corregir con el CONTEXTO.",
     "parameters": {
         "type": "object",
         "properties": {
